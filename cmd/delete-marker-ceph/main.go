@@ -23,18 +23,21 @@ import (
 	"github.com/aws/smithy-go"
 )
 
+const deleteBatchSize = 1000
+
 type cfg struct {
-	Endpoint     string
-	Region       string
-	Bucket       string
-	Prefix       string
-	PrefixBase   string
-	Count        int
-	Concurrency  int
-	Size         int
-	Insecure     bool
-	PathStyle    bool
-	CreateBucket bool
+	Endpoint          string
+	Region            string
+	Bucket            string
+	Prefix            string
+	PrefixBase        string
+	Count             int
+	Concurrency       int
+	DeleteConcurrency int
+	Size              int
+	Insecure          bool
+	PathStyle         bool
+	CreateBucket      bool
 }
 
 func main() {
@@ -44,7 +47,8 @@ func main() {
 	flag.StringVar(&c.Bucket, "bucket", "", "Bucket name")
 	flag.StringVar(&c.PrefixBase, "prefix-base", "dm", "Base path for auto-generated prefix")
 	flag.IntVar(&c.Count, "n", 1000, "Number of objects")
-	flag.IntVar(&c.Concurrency, "c", 64, "Concurrency")
+	flag.IntVar(&c.Concurrency, "c", 64, "Upload concurrency")
+	flag.IntVar(&c.DeleteConcurrency, "delete-c", 8, "DeleteObjects batch concurrency")
 	flag.IntVar(&c.Size, "size", 128, "Object size in bytes")
 	flag.BoolVar(&c.Insecure, "insecure", false, "Skip TLS verification")
 	flag.BoolVar(&c.PathStyle, "path-style", true, "Use path-style addressing")
@@ -55,8 +59,11 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if c.DeleteConcurrency < 1 {
+		log.Fatal("delete-c must be >= 1")
+	}
 
-	c.Prefix = autoPrefix(c.PrefixBase, c.Size, c.Count, c.Concurrency)
+	c.Prefix = autoPrefix(c.PrefixBase, c.Size, c.Count, c.Concurrency, c.DeleteConcurrency)
 
 	ctx := context.Background()
 
@@ -101,40 +108,52 @@ func main() {
 	}
 
 	payload := bytes.Repeat([]byte("x"), c.Size)
+	totalStart := time.Now()
 
-	start := time.Now()
+	uploadStart := time.Now()
 	up, err := uploadObjects(ctx, s3c, c, payload)
+	uploadDur := time.Since(uploadStart)
 	if err != nil {
 		log.Fatalf("upload failed after %d objects: %v", up, err)
 	}
 
+	deleteStart := time.Now()
 	del, err := deleteObjects(ctx, s3c, c)
+	deleteDur := time.Since(deleteStart)
 	if err != nil {
 		log.Fatalf("delete failed after %d objects: %v", del, err)
 	}
 
+	countStart := time.Now()
 	versions, markers, err := countVersionsAndMarkers(ctx, s3c, c)
+	countDur := time.Since(countStart)
 	if err != nil {
 		log.Fatalf("count failed: %v", err)
 	}
 
 	fmt.Println("----- summary -----")
-	fmt.Printf("bucket:           %s\n", c.Bucket)
-	fmt.Printf("prefix:           %s\n", c.Prefix)
-	fmt.Printf("uploaded:         %d\n", up)
-	fmt.Printf("delete requests:  %d\n", del)
-	fmt.Printf("object versions:  %d\n", versions)
-	fmt.Printf("delete markers:   %d\n", markers)
-	fmt.Printf("expected markers: %d\n", c.Count)
-	fmt.Printf("total runtime:    %s\n", time.Since(start))
+	fmt.Printf("bucket:             %s\n", c.Bucket)
+	fmt.Printf("prefix:             %s\n", c.Prefix)
+	fmt.Printf("uploaded:           %d\n", up)
+	fmt.Printf("objects deleted:    %d\n", del)
+	fmt.Printf("delete batches:     %d\n", numDeleteBatches(c.Count))
+	fmt.Printf("delete batch size:  %d\n", deleteBatchSize)
+	fmt.Printf("delete concurrency: %d\n", c.DeleteConcurrency)
+	fmt.Printf("object versions:    %d\n", versions)
+	fmt.Printf("delete markers:     %d\n", markers)
+	fmt.Printf("expected markers:   %d\n", c.Count)
+	fmt.Printf("upload runtime:     %s\n", uploadDur)
+	fmt.Printf("delete runtime:     %s\n", deleteDur)
+	fmt.Printf("count runtime:      %s\n", countDur)
+	fmt.Printf("total runtime:      %s\n", time.Since(totalStart))
 }
 
-func autoPrefix(base string, size, count, concurrency int) string {
+func autoPrefix(base string, size, count, concurrency, deleteConcurrency int) string {
 	base = strings.Trim(base, "/")
 	if base == "" {
 		base = "dm"
 	}
-	return fmt.Sprintf("%s/%db-%d-c%d-%d/", base, size, count, concurrency, time.Now().UnixMilli())
+	return fmt.Sprintf("%s/%db-%d-c%d-dc%d-%d/", base, size, count, concurrency, deleteConcurrency, time.Now().UnixMilli())
 }
 
 func ensureBucket(ctx context.Context, s3c *s3.Client, c cfg) error {
@@ -231,37 +250,98 @@ func uploadObjects(ctx context.Context, s3c *s3.Client, c cfg, payload []byte) (
 	}
 }
 
+type deleteBatch struct {
+	start int
+	end   int
+}
+
 func deleteObjects(ctx context.Context, s3c *s3.Client, c cfg) (int64, error) {
-	const batchSize = 1000
 	var deleted int64
+	jobs := make(chan deleteBatch, c.DeleteConcurrency*2)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
 
-	for start := 1; start <= c.Count; start += batchSize {
-		end := start + batchSize - 1
-		if end > c.Count {
-			end = c.Count
-		}
+	for w := 0; w < c.DeleteConcurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range jobs {
+				objs := make([]s3types.ObjectIdentifier, 0, batch.end-batch.start+1)
+				for i := batch.start; i <= batch.end; i++ {
+					key := fmt.Sprintf("%sobject-%08d", ensureSlash(c.Prefix), i)
+					objs = append(objs, s3types.ObjectIdentifier{Key: aws.String(key)})
+				}
 
-		objs := make([]s3types.ObjectIdentifier, 0, end-start+1)
-		for i := start; i <= end; i++ {
-			key := fmt.Sprintf("%sobject-%08d", ensureSlash(c.Prefix), i)
-			objs = append(objs, s3types.ObjectIdentifier{Key: aws.String(key)})
-		}
+				out, err := s3c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+					Bucket: aws.String(c.Bucket),
+					Delete: &s3types.Delete{
+						Objects: objs,
+						Quiet:   aws.Bool(true),
+					},
+				})
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("delete batch %d-%d: %w", batch.start, batch.end, err):
+					default:
+					}
+					return
+				}
 
-		_, err := s3c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(c.Bucket),
-			Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)},
-		})
-		if err != nil {
-			return deleted, err
-		}
+				if len(out.Errors) > 0 {
+					first := out.Errors[0]
+					key := ""
+					code := ""
+					msg := ""
+					if first.Key != nil {
+						key = aws.ToString(first.Key)
+					}
+					if first.Code != nil {
+						code = aws.ToString(first.Code)
+					}
+					if first.Message != nil {
+						msg = aws.ToString(first.Message)
+					}
+					select {
+					case errCh <- fmt.Errorf("delete batch %d-%d had %d object errors; first key=%q code=%q message=%q", batch.start, batch.end, len(out.Errors), key, code, msg):
+					default:
+					}
+					return
+				}
 
-		deleted += int64(len(objs))
-		if deleted%10000 == 0 || deleted == int64(c.Count) {
-			log.Printf("deleted %d / %d", deleted, c.Count)
-		}
+				n := atomic.AddInt64(&deleted, int64(len(objs)))
+				if n%10000 == 0 || n == int64(c.Count) {
+					log.Printf("deleted %d / %d", n, c.Count)
+				}
+			}
+		}()
 	}
 
-	return deleted, nil
+	go func() {
+		defer close(jobs)
+		for start := 1; start <= c.Count; start += deleteBatchSize {
+			end := start + deleteBatchSize - 1
+			if end > c.Count {
+				end = c.Count
+			}
+			jobs <- deleteBatch{start: start, end: end}
+		}
+	}()
+
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return deleted, err
+	default:
+		return deleted, nil
+	}
+}
+
+func numDeleteBatches(count int) int {
+	if count <= 0 {
+		return 0
+	}
+	return (count + deleteBatchSize - 1) / deleteBatchSize
 }
 
 func countVersionsAndMarkers(ctx context.Context, s3c *s3.Client, c cfg) (int64, int64, error) {
