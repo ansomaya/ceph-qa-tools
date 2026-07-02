@@ -48,7 +48,7 @@ func main() {
 	flag.StringVar(&c.PrefixBase, "prefix-base", "dm", "Base path for auto-generated prefix")
 	flag.IntVar(&c.Count, "n", 1000, "Number of objects")
 	flag.IntVar(&c.Concurrency, "c", 64, "Upload concurrency")
-	flag.IntVar(&c.DeleteConcurrency, "delete-c", 8, "DeleteObjects batch concurrency")
+	flag.IntVar(&c.DeleteConcurrency, "delete-c", 24, "DeleteObjects batch concurrency")
 	flag.IntVar(&c.Size, "size", 128, "Object size in bytes")
 	flag.BoolVar(&c.Insecure, "insecure", false, "Skip TLS verification")
 	flag.BoolVar(&c.PathStyle, "path-style", true, "Use path-style addressing")
